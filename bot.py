@@ -3,218 +3,288 @@ import re
 import logging
 import datetime
 import json
-import difflib
-from typing import Set
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes
+from telegram.ext import filters
 from telegram.helpers import mention_html
 
-# Google APIs
+# Google APIs imports
 import gspread
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 
 # Configure logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ---------------------------
-# Helper functions
-# ---------------------------
-
-def check_negative_content(text: str, negative_words: Set[str]) -> bool:
-    """Check if a message contains negative/inappropriate words"""
-    text_lower = text.lower()
-    return any(re.search(r'\b' + re.escape(word) + r'\b', text_lower) for word in negative_words)
-
-async def get_knowledge_response(query: str, docs_service, knowledge_doc_id: str) -> str:
-    """Search Google Docs for a response with fuzzy matching"""
-    try:
-        doc = docs_service.documents().get(documentId=knowledge_doc_id).execute()
-        content = doc.get('body', {}).get('content', [])
-        full_text = ""
-        for element in content:
-            if 'paragraph' in element:
-                for para in element['paragraph']['elements']:
-                    if 'textRun' in para:
-                        full_text += para['textRun']['content'] + "\n"
-
-        # Exact match first
-        query_lower = query.lower()
-        for line in full_text.split("\n"):
-            if any(word in line.lower() for word in query_lower.split()):
-                return line.strip()
-
-        # Fuzzy match
-        lines_lower = [line.lower() for line in full_text.split("\n")]
-        matches = difflib.get_close_matches(query_lower, lines_lower, n=1, cutoff=0.6)
-        if matches:
-            match_index = lines_lower.index(matches[0])
-            return full_text.split("\n")[match_index].strip()
-
-        return "I don't have information about that yet. I'll save it to learn more."
-    except Exception as e:
-        logger.error(f"Error accessing knowledge base: {e}")
-        return "Sorry, I'm having trouble accessing my knowledge base right now."
-
-async def save_to_learning_sheet(phrase: str, gc, learning_sheet_id: str, context: str = ""):
-    """Save unknown phrases to Google Sheets for later learning"""
-    try:
-        sheet = gc.open_by_key(learning_sheet_id).sheet1
-        existing_data = sheet.get_all_values()
-        existing_phrases = [row[0].lower() for row in existing_data if row]
-        if phrase.lower() not in existing_phrases:
-            sheet.append_row([phrase, context, str(datetime.datetime.now())])
-            logger.info(f"Saved new phrase: {phrase}")
-        else:
-            logger.info(f"Phrase already exists: {phrase}")
-    except Exception as e:
-        logger.error(f"Error saving to learning sheet: {e}")
-
-# ---------------------------
-# Bot Handlers
-# ---------------------------
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle messages with moderation and knowledge response"""
-    if not update.message or not update.message.text:
-        return
-
-    if update.message.from_user.id == context.bot.id:
-        return
-
-    bot_data = context.bot_data
-    negative_words = bot_data.get('negative_words', set())
-
-    # Check negative content
-    if check_negative_content(update.message.text, negative_words):
+class ContentModerationBot:
+    def __init__(self, token: str):
+        self.application = Application.builder().token(token).build()
+        
+        # Initialize negative words list
+        self.negative_words = self.load_negative_words()
+        
+        # Google Docs and Sheets IDs
+        self.knowledge_doc_id = "1uZ0g63V3Zxq8sIXrR3ggGQyArkNiOYseGsaX0hyCr6Y"
+        self.learning_sheet_id = "1sq4zmYnvyWUymfWvv4sRDFdnj31mQKgkGEpQurHHgYk"
+        
+        # Initialize Google services from environment variable
+        self.google_creds = self.setup_google_credentials()
+        self.docs_service = build('docs', 'v1', credentials=self.google_creds)
+        self.sheets_service = build('sheets', 'v4', credentials=self.google_creds)
+        
+        # Initialize gspread for easier Sheets access
+        self.gc = gspread.authorize(self.google_creds)
+        
+        # Register handlers
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("add_knowledge", self.add_knowledge_command))
+        self.application.add_handler(CommandHandler("set_welcome", self.set_welcome_command))
+        
+        # Handle group events
+        self.application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
+        
+        # Store group-specific welcome messages
+        self.welcome_messages = {}
+    
+    def setup_google_credentials(self):
+        """Setup Google credentials from environment variable"""
+        google_creds_json = os.environ.get('GOOGLE_CREDS_JSON')
+        
+        if not google_creds_json:
+            logger.error("GOOGLE_CREDS_JSON environment variable is not set")
+            raise ValueError("Google credentials not found in environment variables")
+        
         try:
-            warning = f"⚠️ Warning: {mention_html(update.message.from_user.id, update.message.from_user.first_name)} used inappropriate language."
-            await update.message.reply_html(warning)
-            await update.message.delete()
-            logger.info(f"Flagged and deleted message from {update.message.from_user.id}: {update.message.text}")
+            creds_dict = json.loads(google_creds_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    'https://www.googleapis.com/auth/documents',
+                    'https://www.googleapis.com/auth/spreadsheets'
+                ]
+            )
+            logger.info("Google credentials successfully loaded from environment variable")
+            return credentials
         except Exception as e:
-            logger.warning(f"Could not delete/reply message: {e}")
-        return
-
-    # Private or mention
-    bot_username = getattr(context.bot, "username", "")
-    is_private = update.message.chat.type == 'private'
-    mentioned = bot_username and bot_username.lower() in update.message.text.lower()
-
-    if is_private or mentioned:
-        query = re.sub(r'@' + re.escape(bot_username) + r'\s*', '', update.message.text, flags=re.IGNORECASE).strip()
-        if not query:
+            logger.error(f"Error loading Google credentials: {e}")
+            raise
+        
+    def load_negative_words(self) -> set:
+        """Load negative/inappropriate words"""
+        return {
+            'hate', 'stupid', 'idiot', 'moron', 'retard', 'shit', 'fuck', 'asshole',
+            'bastard', 'bitch', 'cunt', 'damn', 'hell', 'dumb', 'loser', 
+            'fucking', 'ass', 'dick', 'piss', 'cock', 'pussy', 'fag', 'faggot',
+            'whore', 'slut', 'nigger', 'nigga', 'chink', 'spic', 'kike', 'terrorist'
+        }
+    
+    def check_negative_content(self, text: str) -> bool:
+        """Check if message contains negative/inappropriate words"""
+        text_lower = text.lower()
+        return any(re.search(r'\b' + re.escape(word) + r'\b', text_lower) for word in self.negative_words)
+    
+    def get_knowledge_response(self, query: str) -> str:
+        """Search knowledge base in Google Docs for a response"""
+        try:
+            # Retrieve the document content
+            doc = self.docs_service.documents().get(documentId=self.knowledge_doc_id).execute()
+            content = doc.get('body', {}).get('content', [])
+            
+            # Extract text from the document
+            full_text = ""
+            for element in content:
+                if 'paragraph' in element:
+                    for para_element in element['paragraph']['elements']:
+                        if 'textRun' in para_element:
+                            full_text += para_element['textRun']['content']
+            
+            # Simple keyword matching
+            query_lower = query.lower()
+            lines = full_text.split('\n')
+            
+            for line in lines:
+                line_lower = line.lower()
+                if any(word in line_lower for word in query_lower.split()):
+                    return line.strip()
+            
+            return "I don't have information about that yet. I'll save it to learn more."
+        
+        except Exception as e:
+            logger.error(f"Error accessing knowledge base: {e}")
+            return "Sorry, I'm having trouble accessing my knowledge base right now."
+    
+    def save_to_learning_sheet(self, phrase: str, context: str = ""):
+        """Save unfamiliar phrases to Google Sheets for later learning"""
+        try:
+            sheet = self.gc.open_by_key(self.learning_sheet_id).sheet1
+            
+            # Get current data to avoid duplicates
+            existing_data = sheet.get_all_values()
+            existing_phrases = [row[0].lower() for row in existing_data if row]
+            
+            if phrase.lower() not in existing_phrases:
+                sheet.append_row([phrase, context, str(datetime.datetime.now())])
+                logger.info(f"Saved new phrase to learning sheet: {phrase}")
+            else:
+                logger.info(f"Phrase already exists in learning sheet: {phrase}")
+            
+        except Exception as e:
+            logger.error(f"Error saving to learning sheet: {e}")
+    
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming messages"""
+        message = update.message
+        if not message or not message.text:
             return
-
-        response = await get_knowledge_response(query, bot_data.get('docs_service'), bot_data.get('knowledge_doc_id'))
-        await update.message.reply_text(response)
-
-        if "I don't have information" in response:
-            await save_to_learning_sheet(
-                query,
-                bot_data.get('gc'),
-                bot_data.get('learning_sheet_id'),
-                f"User: {update.message.from_user.id}, Chat: {update.message.chat.id}"
-            )
-
-async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send welcome message when bot is added to a group"""
-    for member in update.message.new_chat_members:
-        if member.id == context.bot.id:
-            chat_id = update.message.chat_id
-            welcome_message = context.bot_data['welcome_messages'].get(
-                chat_id,
-                "Hello! I'm here to help maintain a positive environment. "
-                "I can detect inappropriate language and answer questions based on my knowledge base. "
-                "Use /help to see what I can do."
-            )
-            await update.message.reply_text(welcome_message)
-            break
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Hi! I'm a moderation and assistance bot. "
-        "I can detect inappropriate language and answer questions based on my knowledge base. "
-        "Use /help to see all commands."
-    )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Available commands:\n"
-        "/start - Start interacting with the bot\n"
-        "/help - Show this help message\n"
-        "I automatically monitor messages for inappropriate content and can answer questions "
-        "when you mention me or message me directly."
-    )
-
-# ---------------------------
-# Post-initialization
-# ---------------------------
-
-async def post_init(application):
-    """Initialize bot data and Google services"""
-    bot_data = application.bot_data
-
-    # Negative words
-    bot_data['negative_words'] = {
-        'hate','stupid','idiot','moron','retard','shit','fuck','asshole',
-        'bastard','bitch','cunt','damn','hell','dumb','loser','fucking',
-        'ass','dick','piss','cock','pussy','fag','faggot','whore','slut',
-        'nigger','nigga','chink','spic','kike','terrorist'
-    }
-
-    # Google Docs & Sheets IDs
-    bot_data['knowledge_doc_id'] = os.environ.get('KNOWLEDGE_DOC_ID', '')
-    bot_data['learning_sheet_id'] = os.environ.get('LEARNING_SHEET_ID', '')
-
-    # Google credentials
-    google_creds_json = os.environ.get('GOOGLE_CREDS_JSON')
-    if not google_creds_json:
-        logger.error("GOOGLE_CREDS_JSON not set")
-        return
-
-    try:
-        creds_dict = json.loads(google_creds_json)
-        credentials = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=[
-                'https://www.googleapis.com/auth/documents',
-                'https://www.googleapis.com/auth/spreadsheets'
-            ]
+        
+        # Ignore messages from the bot itself
+        if message.from_user.id == context.bot.id:
+            return
+        
+        # Check for negative content
+        if self.check_negative_content(message.text):
+            # Flag the message
+            warning = f"⚠️ Warning: {mention_html(message.from_user.id, message.from_user.first_name)} used inappropriate language."
+            await message.reply_html(warning)
+            
+            # Delete the inappropriate message
+            await message.delete()
+            
+            # Log this action
+            logger.info(f"Flagged and deleted message from {message.from_user.id}: {message.text}")
+        
+        # Otherwise, try to respond using knowledge base if the bot is mentioned
+        elif context.bot.username.lower() in message.text.lower() or message.chat.type == 'private':
+            # Extract the query (remove bot mention if present)
+            query = re.sub(r'@' + context.bot.username + r'\s*', '', message.text, flags=re.IGNORECASE).strip()
+            
+            if query:
+                response = self.get_knowledge_response(query)
+                await message.reply_text(response)
+                
+                # If no response found, save for learning
+                if "I don't have information" in response:
+                    self.save_to_learning_sheet(query, f"User: {message.from_user.id}, Chat: {message.chat.id}")
+    
+    async def welcome_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send welcome message when bot is added to a group"""
+        for member in update.message.new_chat_members:
+            if member.id == context.bot.id:
+                # Bot was added to the group
+                chat_id = update.message.chat_id
+                welcome_message = self.welcome_messages.get(chat_id, 
+                    "Hello! I'm here to help maintain a positive environment. "
+                    "I can detect inappropriate language and answer questions based on my knowledge base. "
+                    "Use /help to see what I can do.")
+                
+                await update.message.reply_text(welcome_message)
+                break
+    
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /start command"""
+        await update.message.reply_text(
+            "Hi! I'm a moderation and assistance bot. "
+            "I can detect inappropriate language and answer questions based on my knowledge base. "
+            "Use /help to see all available commands."
         )
-        bot_data['google_creds'] = credentials
-        bot_data['docs_service'] = build('docs', 'v1', credentials=credentials)
-        bot_data['sheets_service'] = build('sheets', 'v4', credentials=credentials)
-        bot_data['gc'] = gspread.authorize(credentials)
-        bot_data['welcome_messages'] = {}
-        logger.info("Google services initialized successfully")
-    except Exception as e:
-        logger.error(f"Error initializing Google services: {e}")
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /help command"""
+        await update.message.reply_text(
+            "🤖 Available commands:\n\n"
+            "/start - Start interacting with the bot\n"
+            "/help - Show this help message\n"
+            "/add_knowledge <question> | <answer> - Add new knowledge to my database (admin only)\n"
+            "/set_welcome <message> - Set a custom welcome message for this group (admin only)\n\n"
+            "I automatically monitor messages for inappropriate content and can answer questions "
+            "when you mention me in a group chat or message me directly."
+        )
+    
+    async def add_knowledge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /add_knowledge command"""
+        # Check if user is an admin
+        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in await update.effective_chat.get_administrators()]:
+            if not context.args:
+                await update.message.reply_text("Please provide knowledge in the format: /add_knowledge Question | Answer")
+                return
+            
+            text = ' '.join(context.args)
+            if '|' not in text:
+                await update.message.reply_text("Please separate question and answer with a | character: /add_knowledge Question | Answer")
+                return
+            
+            question, answer = text.split('|', 1)
+            question = question.strip()
+            answer = answer.strip()
+            
+            # Add to knowledge base
+            try:
+                # Format the new content
+                new_content = f"\nQ: {question}\nA: {answer}\n"
+                
+                # Determine where to insert the new content
+                doc = self.docs_service.documents().get(documentId=self.knowledge_doc_id).execute()
+                end_index = doc['body']['content'][-1]['endIndex'] - 1
+                
+                # Create request to insert text
+                requests = [
+                    {
+                        'insertText': {
+                            'location': {
+                                'index': end_index
+                            },
+                            'text': new_content
+                        }
+                    }
+                ]
+                
+                # Execute the request
+                self.docs_service.documents().batchUpdate(
+                    documentId=self.knowledge_doc_id,
+                    body={'requests': requests}
+                ).execute()
+                
+                await update.message.reply_text("✅ Knowledge added successfully!")
+            except Exception as e:
+                logger.error(f"Error adding to knowledge doc: {e}")
+                await update.message.reply_text("❌ Failed to add knowledge. Please check logs for details.")
+        else:
+            await update.message.reply_text("❌ You need to be an administrator to use this command.")
+    
+    async def set_welcome_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /set_welcome command"""
+        # Check if user is an admin
+        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in await update.effective_chat.get_administrators()]:
+            if not context.args:
+                await update.message.reply_text("Please provide a welcome message: /set_welcome Your welcome message here")
+                return
+            
+            welcome_message = ' '.join(context.args)
+            self.welcome_messages[update.message.chat_id] = welcome_message
+            await update.message.reply_text("✅ Welcome message set successfully!")
+        else:
+            await update.message.reply_text("❌ You need to be an administrator to use this command.")
+    
+    def run(self):
+        """Start the bot"""
+        self.application.run_polling()
+        logger.info("Bot is running...")
 
-# ---------------------------
-# Main function
-# ---------------------------
-
-def main():
-    BOT_TOKEN = os.environ.get('BOT_TOKEN')
+# Main execution
+if __name__ == '__main__':
+    # Get bot token from environment variable or use the provided one
+    BOT_TOKEN = os.environ.get('BOT_TOKEN', '8420156018:AAH1_p04cgp4QlnP9UvZXrff1EXTJv_p3Qo')
+    
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is required")
+        logger.error("Please set it in your Render environment variables")
         exit(1)
-
-    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Handlers
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CommandHandler("start", start_command))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_new_member))
-
-    logger.info("Bot is starting...")
-    application.run_polling()
-
-if __name__ == "__main__":
-    main()
+    
+    bot = ContentModerationBot(BOT_TOKEN)
+    bot.run()

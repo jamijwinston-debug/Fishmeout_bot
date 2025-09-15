@@ -13,6 +13,7 @@ from telegram.helpers import mention_html
 import gspread
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 # Configure logging
 logging.basicConfig(
@@ -32,6 +33,10 @@ class ContentModerationBot:
         self.learning_sheet_id = "1sq4zmYnvyWUymfWvv4sRDFdnj31mQKgkGEpQurHHgYk"
         
         # Initialize Google services
+        self.google_creds = None
+        self.docs_service = None
+        self.sheets_service = None
+        self.gc = None
         self.initialize_google_services()
     
     def initialize_google_services(self):
@@ -40,10 +45,23 @@ class ContentModerationBot:
             google_creds_json = os.environ.get('GOOGLE_CREDS_JSON')
             
             if not google_creds_json:
-                logger.error("GOOGLE_CREDS_JSON environment variable is not set")
+                logger.warning("GOOGLE_CREDS_JSON environment variable is not set - Google services disabled")
                 return
             
-            creds_dict = json.loads(google_creds_json)
+            # Try to parse the JSON credentials
+            try:
+                creds_dict = json.loads(google_creds_json)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse GOOGLE_CREDS_JSON: {e}")
+                # Check if it might be a file path instead of JSON string
+                if os.path.exists(google_creds_json):
+                    logger.info(f"GOOGLE_CREDS_JSON appears to be a file path, loading from file")
+                    with open(google_creds_json, 'r') as f:
+                        creds_dict = json.load(f)
+                else:
+                    logger.error("GOOGLE_CREDS_JSON is not valid JSON and not a file path")
+                    return
+            
             self.google_creds = service_account.Credentials.from_service_account_info(
                 creds_dict,
                 scopes=[
@@ -60,6 +78,7 @@ class ContentModerationBot:
             
         except Exception as e:
             logger.error(f"Error initializing Google services: {e}")
+            logger.warning("Continuing without Google services")
         
     def load_negative_words(self) -> set:
         """Load negative/inappropriate words"""
@@ -78,7 +97,7 @@ class ContentModerationBot:
     async def get_knowledge_response(self, query: str) -> str:
         """Search knowledge base in Google Docs for a response"""
         try:
-            if not hasattr(self, 'docs_service'):
+            if not self.docs_service:
                 return "Knowledge base temporarily unavailable."
                 
             # Retrieve the document content
@@ -104,6 +123,9 @@ class ContentModerationBot:
             
             return "I don't have information about that yet. I'll save it to learn more."
         
+        except HttpError as e:
+            logger.error(f"Google Docs API error: {e}")
+            return "Sorry, I'm having trouble accessing my knowledge base right now."
         except Exception as e:
             logger.error(f"Error accessing knowledge base: {e}")
             return "Sorry, I'm having trouble accessing my knowledge base right now."
@@ -111,7 +133,8 @@ class ContentModerationBot:
     async def save_to_learning_sheet(self, phrase: str, context: str = ""):
         """Save unfamiliar phrases to Google Sheets for later learning"""
         try:
-            if not hasattr(self, 'gc'):
+            if not self.gc:
+                logger.warning("Google Sheets not available - skipping save")
                 return
                 
             sheet = self.gc.open_by_key(self.learning_sheet_id).sheet1
@@ -153,7 +176,7 @@ class ContentModerationBot:
                 logger.info(f"Flagged and deleted message from {message.from_user.id}: {message.text}")
             
             # Otherwise, try to respond using knowledge base if the bot is mentioned
-            elif context.bot.username.lower() in message.text.lower() or message.chat.type == 'private':
+            elif context.bot.username and (context.bot.username.lower() in message.text.lower() or message.chat.type == 'private'):
                 # Extract the query (remove bot mention if present)
                 query = re.sub(r'@' + context.bot.username + r'\s*', '', message.text, flags=re.IGNORECASE).strip()
                 
@@ -225,19 +248,25 @@ class ContentModerationBot:
             logger.info("Bot application setup completed successfully")
             logger.info("Starting bot polling...")
             
-            # Start polling
-            await application.run_polling()
+            # Start polling with proper error handling
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling()
+            
+            # Keep the bot running
+            await asyncio.Event().wait()
             
         except Exception as e:
             logger.error(f"Error running bot: {e}")
             # Try to restart after a delay
             await asyncio.sleep(10)
+            logger.info("Restarting bot...")
             await self.run()
 
 # Main execution
 async def main():
-    # Get bot token from environment variable or use the provided one
-    BOT_TOKEN = os.environ.get('BOT_TOKEN', '8420156018:AAH1_p04cgp4QlnP9UvZXrff1EXTJv_p3Qo')
+    # Get bot token from environment variable
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
     
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is required")

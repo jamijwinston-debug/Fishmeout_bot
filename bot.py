@@ -24,15 +24,15 @@ logger = logging.getLogger(__name__)
 class ContentModerationBot:
     def __init__(self, token: str):
         self.token = token
-        self.setup_complete = False
-        
-        # Initialize data structures
         self.negative_words = self.load_negative_words()
         self.welcome_messages = {}
         
         # Google Docs and Sheets IDs
         self.knowledge_doc_id = "1uZ0g63V3Zxq8sIXrR3ggGQyArkNiOYseGsaX0hyCr6Y"
         self.learning_sheet_id = "1sq4zmYnvyWUymfWvv4sRDFdnj31mQKgkGEpQurHHgYk"
+        
+        # Initialize Google services
+        self.initialize_google_services()
     
     def initialize_google_services(self):
         """Initialize Google services from environment variable"""
@@ -41,7 +41,7 @@ class ContentModerationBot:
             
             if not google_creds_json:
                 logger.error("GOOGLE_CREDS_JSON environment variable is not set")
-                return False
+                return
             
             creds_dict = json.loads(google_creds_json)
             self.google_creds = service_account.Credentials.from_service_account_info(
@@ -57,11 +57,9 @@ class ContentModerationBot:
             self.gc = gspread.authorize(self.google_creds)
             
             logger.info("Google services successfully initialized")
-            return True
             
         except Exception as e:
             logger.error(f"Error initializing Google services: {e}")
-            return False
         
     def load_negative_words(self) -> set:
         """Load negative/inappropriate words"""
@@ -212,37 +210,29 @@ class ContentModerationBot:
         except Exception as e:
             logger.error(f"Error in help command: {e}")
     
-    async def setup_application(self):
-        """Set up the Telegram application with handlers"""
-        try:
-            # Create application
-            self.application = Application.builder().token(self.token).build()
-            
-            # Register handlers
-            self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-            self.application.add_handler(CommandHandler("start", self.start_command))
-            self.application.add_handler(CommandHandler("help", self.help_command))
-            self.application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
-            
-            # Initialize Google services
-            google_initialized = self.initialize_google_services()
-            if not google_initialized:
-                logger.warning("Google services initialization failed - some features may not work")
-            
-            self.setup_complete = True
-            logger.info("Bot application setup completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Error setting up application: {e}")
-            raise
-    
     async def run(self):
         """Start the bot with polling"""
-        if not self.setup_complete:
-            await self.setup_application()
-        
-        logger.info("Starting bot polling...")
-        await self.application.run_polling()
+        try:
+            # Create application
+            application = Application.builder().token(self.token).build()
+            
+            # Register handlers
+            application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            application.add_handler(CommandHandler("start", self.start_command))
+            application.add_handler(CommandHandler("help", self.help_command))
+            application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
+            
+            logger.info("Bot application setup completed successfully")
+            logger.info("Starting bot polling...")
+            
+            # Start polling
+            await application.run_polling()
+            
+        except Exception as e:
+            logger.error(f"Error running bot: {e}")
+            # Try to restart after a delay
+            await asyncio.sleep(10)
+            await self.run()
 
 # Main execution
 async def main():
@@ -255,14 +245,7 @@ async def main():
     
     # Create and run bot
     bot = ContentModerationBot(BOT_TOKEN)
-    
-    try:
-        await bot.run()
-    except Exception as e:
-        logger.error(f"Fatal error running bot: {e}")
-        # Try to restart after a delay
-        await asyncio.sleep(10)
-        await bot.run()
+    await bot.run()
 
 if __name__ == '__main__':
     # Run the async main function

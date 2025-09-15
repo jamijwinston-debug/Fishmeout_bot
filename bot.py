@@ -4,9 +4,9 @@ import logging
 import datetime
 import json
 from typing import Dict, List, Set
-from telegram import Update, Chat, ChatMember
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-from telegram.utils.helpers import mention_html
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.helpers import mention_html
 
 # Google APIs imports
 import gspread
@@ -22,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 class ContentModerationBot:
     def __init__(self, token: str):
-        self.updater = Updater(token, use_context=True)
-        self.dispatcher = self.updater.dispatcher
+        self.application = Application.builder().token(token).build()
         
         # Initialize negative words list
         self.negative_words = self.load_negative_words()
@@ -41,14 +40,14 @@ class ContentModerationBot:
         self.gc = gspread.authorize(self.google_creds)
         
         # Register handlers
-        self.dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, self.handle_message))
-        self.dispatcher.add_handler(CommandHandler("start", self.start_command))
-        self.dispatcher.add_handler(CommandHandler("help", self.help_command))
-        self.dispatcher.add_handler(CommandHandler("add_knowledge", self.add_knowledge_command))
-        self.dispatcher.add_handler(CommandHandler("set_welcome", self.set_welcome_command))
+        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(CommandHandler("start", self.start_command))
+        self.application.add_handler(CommandHandler("help", self.help_command))
+        self.application.add_handler(CommandHandler("add_knowledge", self.add_knowledge_command))
+        self.application.add_handler(CommandHandler("set_welcome", self.set_welcome_command))
         
         # Handle group events
-        self.dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members, self.welcome_new_member))
+        self.application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
         
         # Store group-specific welcome messages
         self.welcome_messages = {}
@@ -201,7 +200,7 @@ class ContentModerationBot:
             logger.error(f"Error adding to knowledge doc: {e}")
             return False
     
-    def handle_message(self, update: Update, context: CallbackContext):
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle incoming messages"""
         message = update.message
         if not message or not message.text:
@@ -215,10 +214,10 @@ class ContentModerationBot:
         if self.check_negative_content(message.text):
             # Flag the message
             warning = f"⚠️ Warning: {mention_html(message.from_user.id, message.from_user.first_name)} used inappropriate language."
-            message.reply_html(warning)
+            await message.reply_html(warning)
             
             # Delete the inappropriate message
-            message.delete()
+            await message.delete()
             
             # Log this action
             logger.info(f"Flagged and deleted message from {message.from_user.id}: {message.text}")
@@ -230,13 +229,13 @@ class ContentModerationBot:
             
             if query:
                 response = self.get_knowledge_response(query)
-                message.reply_text(response)
+                await message.reply_text(response)
                 
                 # If no response found, save for learning
                 if "I don't have information" in response:
                     self.save_to_learning_sheet(query, f"User: {message.from_user.id}, Chat: {message.chat.id}")
     
-    def welcome_new_member(self, update: Update, context: CallbackContext):
+    async def welcome_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Send welcome message when bot is added to a group"""
         for member in update.message.new_chat_members:
             if member.id == context.bot.id:
@@ -247,20 +246,20 @@ class ContentModerationBot:
                     "I can detect inappropriate language and answer questions based on my knowledge base. "
                     "Use /help to see what I can do.")
                 
-                update.message.reply_text(welcome_message)
+                await update.message.reply_text(welcome_message)
                 break
     
-    def start_command(self, update: Update, context: CallbackContext):
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
-        update.message.reply_text(
+        await update.message.reply_text(
             "Hi! I'm a moderation and assistance bot. "
             "I can detect inappropriate language and answer questions based on my knowledge base. "
             "Use /help to see all available commands."
         )
     
-    def help_command(self, update: Update, context: CallbackContext):
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /help command"""
-        update.message.reply_text(
+        await update.message.reply_text(
             "🤖 Available commands:\n\n"
             "/start - Start interacting with the bot\n"
             "/help - Show this help message\n"
@@ -270,17 +269,17 @@ class ContentModerationBot:
             "when you mention me in a group chat or message me directly."
         )
     
-    def add_knowledge_command(self, update: Update, context: CallbackContext):
+    async def add_knowledge_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /add_knowledge command"""
         # Check if user is an admin (simplified check)
-        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in update.effective_chat.get_administrators()]:
+        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in await update.effective_chat.get_administrators()]:
             if not context.args:
-                update.message.reply_text("Please provide knowledge in the format: /add_knowledge Question | Answer")
+                await update.message.reply_text("Please provide knowledge in the format: /add_knowledge Question | Answer")
                 return
             
             text = ' '.join(context.args)
             if '|' not in text:
-                update.message.reply_text("Please separate question and answer with a | character: /add_knowledge Question | Answer")
+                await update.message.reply_text("Please separate question and answer with a | character: /add_knowledge Question | Answer")
                 return
             
             question, answer = text.split('|', 1)
@@ -288,31 +287,30 @@ class ContentModerationBot:
             answer = answer.strip()
             
             if self.add_to_knowledge_doc(question, answer):
-                update.message.reply_text("✅ Knowledge added successfully!")
+                await update.message.reply_text("✅ Knowledge added successfully!")
             else:
-                update.message.reply_text("❌ Failed to add knowledge. Please check logs for details.")
+                await update.message.reply_text("❌ Failed to add knowledge. Please check logs for details.")
         else:
-            update.message.reply_text("❌ You need to be an administrator to use this command.")
+            await update.message.reply_text("❌ You need to be an administrator to use this command.")
     
-    def set_welcome_command(self, update: Update, context: CallbackContext):
+    async def set_welcome_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /set_welcome command"""
         # Check if user is an admin
-        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in update.effective_chat.get_administrators()]:
+        if update.message.chat.type == 'private' or update.effective_user.id in [admin.user.id for admin in await update.effective_chat.get_administrators()]:
             if not context.args:
-                update.message.reply_text("Please provide a welcome message: /set_welcome Your welcome message here")
+                await update.message.reply_text("Please provide a welcome message: /set_welcome Your welcome message here")
                 return
             
             welcome_message = ' '.join(context.args)
             self.welcome_messages[update.message.chat_id] = welcome_message
-            update.message.reply_text("✅ Welcome message set successfully!")
+            await update.message.reply_text("✅ Welcome message set successfully!")
         else:
-            update.message.reply_text("❌ You need to be an administrator to use this command.")
+            await update.message.reply_text("❌ You need to be an administrator to use this command.")
     
     def run(self):
         """Start the bot"""
-        self.updater.start_polling()
+        self.application.run_polling()
         logger.info("Bot is running...")
-        self.updater.idle()
 
 # Main execution
 if __name__ == '__main__':

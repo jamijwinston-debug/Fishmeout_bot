@@ -5,7 +5,8 @@ import datetime
 import json
 from typing import Dict, List, Set
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes
+from telegram.ext import filters
 from telegram.helpers import mention_html
 
 # Google APIs imports

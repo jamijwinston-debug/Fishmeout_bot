@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import datetime
+import json
 from typing import Dict, List, Set
 from telegram import Update, Chat, ChatMember
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
@@ -20,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class ContentModerationBot:
-    def __init__(self, token: str, google_credentials_path: str):
+    def __init__(self, token: str):
         self.updater = Updater(token, use_context=True)
         self.dispatcher = self.updater.dispatcher
         
@@ -31,14 +32,8 @@ class ContentModerationBot:
         self.knowledge_doc_id = "1uZ0g63V3Zxq8sIXrR3ggGQyArkNiOYseGsaX0hyCr6Y"
         self.learning_sheet_id = "1sq4zmYnvyWUymfWvv4sRDFdnj31mQKgkGEpQurHHgYk"
         
-        # Initialize Google services
-        self.google_creds = service_account.Credentials.from_service_account_file(
-            google_credentials_path,
-            scopes=[
-                'https://www.googleapis.com/auth/documents',
-                'https://www.googleapis.com/auth/spreadsheets'
-            ]
-        )
+        # Initialize Google services from environment variable
+        self.google_creds = self.setup_google_credentials()
         self.docs_service = build('docs', 'v1', credentials=self.google_creds)
         self.sheets_service = build('sheets', 'v4', credentials=self.google_creds)
         
@@ -57,6 +52,29 @@ class ContentModerationBot:
         
         # Store group-specific welcome messages
         self.welcome_messages = {}
+    
+    def setup_google_credentials(self):
+        """Setup Google credentials from environment variable"""
+        google_creds_json = os.environ.get('GOOGLE_CREDS_JSON')
+        
+        if not google_creds_json:
+            logger.error("GOOGLE_CREDS_JSON environment variable is not set")
+            raise ValueError("Google credentials not found in environment variables")
+        
+        try:
+            creds_dict = json.loads(google_creds_json)
+            credentials = service_account.Credentials.from_service_account_info(
+                creds_dict,
+                scopes=[
+                    'https://www.googleapis.com/auth/documents',
+                    'https://www.googleapis.com/auth/spreadsheets'
+                ]
+            )
+            logger.info("Google credentials successfully loaded from environment variable")
+            return credentials
+        except Exception as e:
+            logger.error(f"Error loading Google credentials: {e}")
+            raise
         
     def load_negative_words(self) -> Set[str]:
         """Load negative/inappropriate words from a file or database"""
@@ -298,14 +316,13 @@ class ContentModerationBot:
 
 # Main execution
 if __name__ == '__main__':
-    # Configuration
-    BOT_TOKEN = os.environ.get('BOT_TOKEN') or 'YOUR_BOT_TOKEN_HERE'
-    GOOGLE_CREDS_PATH = 'fishmeout-credentials.json'
+    # Get bot token from environment variable
+    BOT_TOKEN = os.environ.get('BOT_TOKEN')
     
-    if not BOT_TOKEN or BOT_TOKEN == 'YOUR_BOT_TOKEN_HERE':
+    if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable is required")
-        logger.error("Please set it with: export BOT_TOKEN='your_bot_token_here'")
+        logger.error("Please set it in your Render environment variables")
         exit(1)
     
-    bot = ContentModerationBot(BOT_TOKEN, GOOGLE_CREDS_PATH)
+    bot = ContentModerationBot(BOT_TOKEN)
     bot.run()
